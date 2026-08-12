@@ -31,6 +31,30 @@ from ..utils.helpers import ensure_directory
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 
+# Keys each exporter reads. 'nodes'/'edges' are accepted as aliases for
+# 'entities'/'relationships' because that is the shape ContextGraph.to_dict()
+# emits, and because Neo4jCSVExporter._normalize_graph already treats the two
+# vocabularies as interchangeable. Without the aliases, exporting a context
+# graph -- the most direct path from this library's own graph type to YAML --
+# produced an empty file.
+_SEMANTIC_NETWORK_KEYS = (
+    "entities",
+    "relationships",
+    "triplets",
+    "nodes",
+    "edges",
+    "metadata",
+)
+_SCHEMA_KEYS = (
+    "classes",
+    "properties",
+    "namespaces",
+    "uri",
+    "title",
+    "description",
+    "version",
+)
+
 
 def _require_mapping(data: Any, expected_keys: Sequence[str]) -> None:
     """Reject non-mapping export input with an actionable error.
@@ -53,11 +77,48 @@ def _require_mapping(data: Any, expected_keys: Sequence[str]) -> None:
         ProcessingError: if ``data`` is not a mapping.
     """
     if not isinstance(data, Mapping):
-        keys = "/".join(f"'{key}'" for key in expected_keys)
+        keys = _format_keys(expected_keys)
         raise ProcessingError(
             f"Cannot export object of type '{type(data).__name__}': "
             f"expected a dict with {keys}."
         )
+
+
+def _format_keys(keys: Sequence[str]) -> str:
+    """Render key names for an error message: ``'a'/'b'/'c'``."""
+    return "/".join(f"'{key}'" for key in keys)
+
+
+def _require_recognized_keys(data: Mapping, recognized_keys: Sequence[str]) -> None:
+    """Reject a mapping whose keys this exporter does not read.
+
+    The exporters build their output by looking up a fixed set of keys, each
+    defaulting to an empty collection. A mapping keyed by anything else
+    therefore serialised to a structurally valid file with every collection
+    empty -- the caller's records dropped, no exception, and the progress log
+    reporting a completed export. The only way to notice was to open the file.
+
+    An empty mapping is allowed through: exporting a graph that genuinely has
+    no records is legitimate, and it carries no data that could be lost.
+
+    Args:
+        data: Mapping already validated by :func:`_require_mapping`.
+        recognized_keys: Keys this exporter reads, including aliases.
+
+    Raises:
+        ProcessingError: if ``data`` is non-empty and shares no key with
+            ``recognized_keys``.
+    """
+    if not data:
+        return
+    if any(key in data for key in recognized_keys):
+        return
+    raise ProcessingError(
+        f"Cannot export mapping with keys {_format_keys(sorted(data))}: "
+        f"none is recognized by this exporter, which reads "
+        f"{_format_keys(recognized_keys)}. Exporting it would silently "
+        f"produce an empty file."
+    )
 
 
 class SemanticNetworkYAMLExporter:
@@ -119,18 +180,25 @@ class SemanticNetworkYAMLExporter:
 
         Args:
             semantic_network: Semantic network dictionary containing:
-                - entities: List of entity dictionaries
+                - entities: List of entity dictionaries (alias: 'nodes')
                 - relationships: List of relationship dictionaries
+                  (alias: 'edges')
                 - triplets: List of triplet dictionaries (optional)
                 - metadata: Metadata dictionary (optional)
+
+                The 'nodes'/'edges' aliases accept ``ContextGraph.to_dict()``
+                output directly, matching how ``Neo4jCSVExporter`` treats the
+                two vocabularies.
             **options: Additional export options (unused)
 
         Raises:
-            ProcessingError: if ``semantic_network`` is not a mapping. A bare
-                list of records cannot be exported here because this format
-                distinguishes entities, relationships, and triplets, and
-                guessing which one a list represents would silently mislabel
-                it.
+            ProcessingError: if ``semantic_network`` is not a mapping, or is a
+                non-empty mapping sharing no key with the recognized set. A
+                bare list of records cannot be exported here because this
+                format distinguishes entities, relationships, and triplets,
+                and guessing which one a list represents would silently
+                mislabel it; an unrecognized mapping is rejected because
+                serializing it would produce an empty file.
 
         Returns:
             String containing YAML representation of semantic network
@@ -144,6 +212,7 @@ class SemanticNetworkYAMLExporter:
             >>> yaml_str = exporter.export_semantic_network(network)
         """
         _require_mapping(semantic_network, ("entities", "relationships", "triplets"))
+        _require_recognized_keys(semantic_network, _SEMANTIC_NETWORK_KEYS)
 
         # Track YAML export
         tracking_id = self.progress_tracker.start_tracking(
@@ -163,8 +232,12 @@ class SemanticNetworkYAMLExporter:
                     "version": "1.0",
                     **semantic_network.get("metadata", {}),
                 },
-                "entities": semantic_network.get("entities", []),
-                "relationships": semantic_network.get("relationships", []),
+                "entities": semantic_network.get("nodes")
+                or semantic_network.get("entities")
+                or [],
+                "relationships": semantic_network.get("edges")
+                or semantic_network.get("relationships")
+                or [],
                 "triplets": semantic_network.get("triplets", []),
             }
 
@@ -351,6 +424,7 @@ class YAMLSchemaExporter:
             ProcessingError: if ``ontology`` is not a mapping.
         """
         _require_mapping(ontology, ("classes", "properties"))
+        _require_recognized_keys(ontology, _SCHEMA_KEYS)
 
         yaml_data = {
             "ontology": {
